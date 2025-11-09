@@ -13,7 +13,7 @@ import logging
 import ctypes
 from math import radians
 from multiprocessing import cpu_count
-import concurrent.futures
+import concurrent.futures  # [ALREADY PRESENT]
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -175,8 +175,8 @@ def handle_distmat_nans(dist_mat, replace_nan_distances_with=None):
     elif replace_nan_distances_with == 'min':
         col_min = np.nanmin(dist_mat, 0, keepdims=1)
         row_min = np.nanmin(dist_mat, 1, keepdims=1)
-        missing_vals = np.minimum(((np.repeat(col_min, len(row_min), 0),
-                                    np.repeat(row_min, len(col_min), 1))))
+        missing_vals = np.minimum(((np.repeat(col_min, len(row_mean), 0),
+                                    np.repeat(row_mean, len(col_mean), 1))))
     else:
         raise NotImplementedError(
             'replace_nan_distances_with={} is not supported'.format(
@@ -199,8 +199,9 @@ def process_master(args):
         cores=1  # Important: don't parallelize inner function!
     )
     return i, dist_list, shift_list
- # ..........................Changed code END..........................
-    
+# ..........................Changed code END..........................
+
+
 def distance_matrix(stream_list, shift_len=0.0,
                     replace_nan_distances_with=None,
                     allow_individual_trace_shifts=True, cores=1):
@@ -261,7 +262,7 @@ def distance_matrix(stream_list, shift_len=0.0,
     shift_mat[:] = np.nan
     shift_dict = dict()
 
-     # ..........................Changed code BEGIN..........................
+    # ..........................Changed code BEGIN..........................
     args = [
         (i, master, stream_list, shift_len, allow_individual_trace_shifts)
         for i, master in enumerate(stream_list)
@@ -271,7 +272,7 @@ def distance_matrix(stream_list, shift_len=0.0,
         results = executor.map(process_master, args)
 
         for i, dist_list, shift_list in results:
-            dist_mat[i] = 1 - dist_list
+            dist_mat[i] = 1 - np.abs(dist_list)  # [CHANGED] use absolute coherence: distance = 1 - |cc|
             master_ids = [tr.id for tr in stream_list[i]]
             master_trace_indcs = [
                 j for j, tr_id in enumerate(uniq_traces) if tr_id in master_ids]
@@ -281,8 +282,8 @@ def distance_matrix(stream_list, shift_len=0.0,
             trace_shift_dict = dict(zip(master_ids, shift_mat_list))
             shift_dict[i] = trace_shift_dict
     # ..........................Changed code END..........................
-    
-                        if shift_len == 0:
+
+    if shift_len == 0:
         dist_mat = handle_distmat_nans(
             dist_mat, replace_nan_distances_with=replace_nan_distances_with)
     else:
@@ -306,7 +307,9 @@ def distance_matrix(stream_list, shift_len=0.0,
 
 def cluster(template_list, show=True, corr_thresh=0.3, shift_len=0,
             allow_individual_trace_shifts=True, save_corrmat=False,
-            replace_nan_distances_with=None, cores='all', **kwargs):
+            replace_nan_distances_with=None, cores='all',
+            dendrogram_path=None, dendrogram_kwargs=None,  # [ADDED]
+            **kwargs):
     """
     Cluster template waveforms based on average correlations.
 
@@ -328,38 +331,10 @@ def cluster(template_list, show=True, corr_thresh=0.3, shift_len=0,
     can be controled with parameters from scipy.cluster.hierarchy.linkage as
     kwargs.
 
-    :type template_list: list
-    :param template_list:
-        List of tuples of the template (:class:`obspy.core.stream.Stream`)
-        and the template id to compute clustering for
-    :type show: bool
-    :param show: plot linkage on screen if True, defaults to True
-    :type corr_thresh: float
-    :param corr_thresh: Cross-channel correlation threshold for grouping
-    :type shift_len: float
-    :param shift_len: How many seconds to allow the templates to shift
-    :type allow_individual_trace_shifts: bool
-    :param allow_individual_trace_shifts:
-        Controls whether templates are shifted by shift_len in relation to the
-        picks as a whole, or whether each trace can be shifted individually.
-        Defaults to True.
-    :type save_corrmat: bool
-    :param save_corrmat:
-        If True will save the distance matrix to dist_mat.npy in the local
-        directory.
-    :type replace_nan_distances_with: None, 'mean', 'min', or float
-    :param replace_nan_distances_with:
-        Controls how the clustering handles nan-distances in the distance
-        matrix. None/False only performs a check, while other choices (e.g.,
-        1, 'mean', 'min' or float) replace nans in the distance matrix.
-    :type cores: int
-    :param cores:
-        number of cores to use when computing the distance matrix, defaults to
-        'all' which will work out how many cpus are available and hog them.
-
-    :returns:
-        List of groups. Each group is a list of
-        :class:`obspy.core.stream.Stream` making up that group.
+    [ADDED]
+    - You can pass a specific linkage method via kwargs, e.g., method='complete' or method='average'.
+    - If dendrogram_path is provided, the dendrogram will be saved to that path (and not shown unless show=True).
+      You can pass dendrogram_kwargs (e.g., {'truncate_mode': 'lastp', 'p': 50, 'no_labels': True}) to style the plot.
     """
     if cores == 'all':
         num_cores = cpu_count()
@@ -380,12 +355,43 @@ def cluster(template_list, show=True, corr_thresh=0.3, shift_len=0,
         dist_mat, replace_nan_distances_with=replace_nan_distances_with)
     dist_vec = squareform(dist_mat)
     Logger.info('Computing linkage')
-    Z = linkage(dist_vec, **kwargs)
-    if show:
-        Logger.info('Plotting the dendrogram')
-        dendrogram(Z, color_threshold=1 - corr_thresh,
-                   distance_sort='ascending')
-        plt.show()
+    Z = linkage(dist_vec, **kwargs)  # [NOTE] method can be provided via kwargs, e.g. method='complete'
+    # ..........................Changed code BEGIN..........................
+    if show or dendrogram_path:
+        Logger.info('Generating the dendrogram')
+        n = len(stream_list)
+        # Make the figure wider for large n (clamped to reasonable bounds)
+        width = min(48, max(12, 0.004 * n + 10))  # [ADDED]
+        height = 6
+        fig, ax = plt.subplots(figsize=(width, height))
+        # Default to no labels to reduce clutter; allow user overrides
+        dendro_args = dict(color_threshold=1 - corr_thresh,
+                           distance_sort='ascending',
+                           no_labels=True)  # [ADDED]
+        if dendrogram_kwargs:
+            dendro_args.update(dendrogram_kwargs)  # [ADDED]
+        dendrogram(Z, **dendro_args)
+        # Add a horizontal threshold line
+        ax.axhline(1 - corr_thresh, color='red', linestyle='--', linewidth=1.2,
+                   label=f'Threshold (corr={corr_thresh:.2f})')  # [ADDED]
+        ax.set_ylabel('Distance (1 - |coherence|)')  # [CHANGED] reflect absolute distance
+        ax.set_title(f'Hierarchical clustering (n={n})')
+        ax.legend(loc='upper right', frameon=False)
+        fig.tight_layout()
+        if dendrogram_path:
+            dirn = os.path.dirname(dendrogram_path)
+            if dirn:
+                os.makedirs(dirn, exist_ok=True)  # [ADDED]
+            fig.savefig(dendrogram_path, dpi=200, bbox_inches='tight')  # [ADDED]
+            Logger.info('Saved dendrogram to %s', dendrogram_path)
+            if show:
+                plt.show()
+            else:
+                plt.close(fig)
+        else:
+            plt.show()
+    # ..........................Changed code END..........................
+
     # Get the indices of the groups
     Logger.info('Clustering')
     indices = fcluster(Z, t=1 - corr_thresh, criterion='distance')
