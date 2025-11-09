@@ -308,81 +308,116 @@ def distance_matrix(stream_list, shift_len=0.0,
 def cluster(template_list, show=True, corr_thresh=0.3, shift_len=0,
             allow_individual_trace_shifts=True, save_corrmat=False,
             replace_nan_distances_with=None, cores='all',
-            dendrogram_path=None, dendrogram_kwargs=None,  # [ADDED]
             **kwargs):
     """
-    Cluster template waveforms based on average correlations.
+    Cluster template waveforms using hierarchical linkage on absolute
+    cross-channel correlation distances.
 
-    Function to take a set of templates and cluster them, will return groups
-    as lists of streams.  Clustering is done by computing the cross-channel
-    correlation sum of each stream in stream_list with every other stream in
-    the list.  :mod:`scipy.cluster.hierarchy` functions are then used to
-    compute the complete distance matrix, where distance is 1 minus the
-    normalised cross-correlation sum such that larger distances are less
-    similar events.  Groups are then created by clustering the distance matrix
-    at distances less than 1 - corr_thresh.
+    Distance definition (implicit in distance_matrix): d(i,j) = 1 - |coherence(i,j)|.
 
-    When distance_matrix contains NaNs (event pairs that cannot be directly
-    compared), then the mean correlation between templates is used instead of
-    NaN (see https://github.com/eqcorrscan/EQcorrscan/issues/484).
+    Parameters
+    ----------
+    template_list : list of (Stream, id)
+        Each element is a tuple of the waveform Stream and its identifier.
+    show : bool
+        If True, display dendrogram interactively.
+    corr_thresh : float
+        Correlation threshold; clustering cut performed at distance = 1 - corr_thresh.
+    shift_len : float
+        Allowed shift length (seconds) for cross-channel correlation alignment.
+    allow_individual_trace_shifts : bool
+        Whether each trace can shift independently (True) or a single lag is used (False).
+    save_corrmat : bool
+        If True, save numpy distance matrix as dist_mat.npy.
+    replace_nan_distances_with : {None, 'mean', 'min', float}
+        Strategy to fill NaN distances prior to linkage.
+    cores : {'all', int}
+        Number of processes used by distance_matrix. 'all' auto-detects cpu_count().
+    **kwargs :
+        Flexible additional parameters:
+          linkage: method='complete' | 'average' | 'single' | ...
+          method, metric, optimal_ordering: passed to scipy.cluster.hierarchy.linkage
+          dendrogram_path: str path to save dendrogram (PNG, etc.)
+          dendrogram_kwargs: dict of extra dendrogram arguments
+        Any other kwargs are ignored (with a warning).
 
-    Will compute the distance matrix in parallel, using all available cores.
-    The method, metric, and order to compute linkage from the distance matrix
-    can be controled with parameters from scipy.cluster.hierarchy.linkage as
-    kwargs.
-
-    [ADDED]
-    - You can pass a specific linkage method via kwargs, e.g., method='complete' or method='average'.
-    - If dendrogram_path is provided, the dendrogram will be saved to that path (and not shown unless show=True).
-      You can pass dendrogram_kwargs (e.g., {'truncate_mode': 'lastp', 'p': 50, 'no_labels': True}) to style the plot.
+    Returns
+    -------
+    groups : list
+        List of groups; each group is a list of (Stream, id) tuples.
     """
-    if cores == 'all':
-        num_cores = cpu_count()
-    else:
-        num_cores = cores
-    # Extract only the Streams from stream_list
-    stream_list = [x[0] for x in template_list]
-    # Compute the distance matrix
-    Logger.info('Computing the distance matrix using %i cores' % num_cores)
-    dist_mat, shift_mat, shift_dict = distance_matrix(
-        stream_list=stream_list, shift_len=shift_len, cores=num_cores,
+    # Resolve core count
+    num_cores = cpu_count() if cores == 'all' else cores
+
+    # Extract Streams
+    stream_list = [tpl[0] for tpl in template_list]
+
+    Logger.info('Computing the distance matrix using %i cores', num_cores)
+    dist_mat, shift_mat, _shift_dict = distance_matrix(
+        stream_list=stream_list,
+        shift_len=shift_len,
+        cores=num_cores,
         replace_nan_distances_with=replace_nan_distances_with,
-        allow_individual_trace_shifts=allow_individual_trace_shifts)
+        allow_individual_trace_shifts=allow_individual_trace_shifts
+    )
+
     if save_corrmat:
         np.save('dist_mat.npy', dist_mat)
-        Logger.info('Saved the distance matrix as dist_mat.npy')
+        Logger.info('Saved distance matrix to dist_mat.npy')
+
     dist_mat = handle_distmat_nans(
-        dist_mat, replace_nan_distances_with=replace_nan_distances_with)
+        dist_mat,
+        replace_nan_distances_with=replace_nan_distances_with
+    )
+
+    # Condense matrix for linkage
     dist_vec = squareform(dist_mat)
-    Logger.info('Computing linkage')
-    Z = linkage(dist_vec, **kwargs)  # [NOTE] method can be provided via kwargs, e.g. method='complete'
-    # ..........................Changed code BEGIN..........................
+
+    # Extract linkage kwargs
+    linkage_allowed = {'method', 'metric', 'optimal_ordering'}
+    linkage_kwargs = {k: v for k, v in kwargs.items() if k in linkage_allowed}
+
+    # # Find ignored kwargs (for user awareness)
+    # ignored = [k for k in kwargs.keys()
+    #            if k not in linkage_allowed
+    #            and k not in ('dendrogram_path', 'dendrogram_kwargs')]
+    # if ignored:
+    #     Logger.warning('Ignoring non-linkage kwargs: %s', ', '.join(ignored))
+
+    Logger.info('Computing linkage with kwargs: %s', linkage_kwargs)
+    Z = linkage(dist_vec, **linkage_kwargs)
+
+    # Dendrogram handling
+    dendrogram_path = kwargs.get('dendrogram_path')
+    dendrogram_user = kwargs.get('dendrogram_kwargs', {})
+
     if show or dendrogram_path:
-        Logger.info('Generating the dendrogram')
+        Logger.info('Generating dendrogram (threshold=%.3f)', 1 - corr_thresh)
         n = len(stream_list)
-        # Make the figure wider for large n (clamped to reasonable bounds)
-        width = min(48, max(12, 0.004 * n + 10))  # [ADDED]
+        width = min(48, max(12, 0.004 * n + 10))
         height = 6
         fig, ax = plt.subplots(figsize=(width, height))
-        # Default to no labels to reduce clutter; allow user overrides
-        dendro_args = dict(color_threshold=1 - corr_thresh,
-                           distance_sort='ascending',
-                           no_labels=True)  # [ADDED]
-        if dendrogram_kwargs:
-            dendro_args.update(dendrogram_kwargs)  # [ADDED]
+
+        dendro_args = dict(
+            color_threshold=1 - corr_thresh,
+            distance_sort='ascending',
+            no_labels=True
+        )
+        dendro_args.update(dendrogram_user)
+
         dendrogram(Z, **dendro_args)
-        # Add a horizontal threshold line
         ax.axhline(1 - corr_thresh, color='red', linestyle='--', linewidth=1.2,
-                   label=f'Threshold (corr={corr_thresh:.2f})')  # [ADDED]
-        ax.set_ylabel('Distance (1 - |coherence|)')  # [CHANGED] reflect absolute distance
-        ax.set_title(f'Hierarchical clustering (n={n})')
+                   label=f'Cut @ corr={corr_thresh:.2f}')
+        ax.set_ylabel('Distance (1 - |coherence|)')
+        method_for_title = linkage_kwargs.get('method', 'single')
+        ax.set_title(f'Hierarchical clustering (n={n}, method={method_for_title})')
         ax.legend(loc='upper right', frameon=False)
         fig.tight_layout()
         if dendrogram_path:
-            dirn = os.path.dirname(dendrogram_path)
-            if dirn:
-                os.makedirs(dirn, exist_ok=True)  # [ADDED]
-            fig.savefig(dendrogram_path, dpi=200, bbox_inches='tight')  # [ADDED]
+            outdir = os.path.dirname(dendrogram_path)
+            if outdir:
+                os.makedirs(outdir, exist_ok=True)
+            fig.savefig(dendrogram_path, dpi=200, bbox_inches='tight')
             Logger.info('Saved dendrogram to %s', dendrogram_path)
             if show:
                 plt.show()
@@ -390,35 +425,22 @@ def cluster(template_list, show=True, corr_thresh=0.3, shift_len=0,
                 plt.close(fig)
         else:
             plt.show()
-    # ..........................Changed code END..........................
 
-    # Get the indices of the groups
-    Logger.info('Clustering')
-    indices = fcluster(Z, t=1 - corr_thresh, criterion='distance')
-    # Indices start at 1...
-    group_ids = list(set(indices))  # Unique list of group ids
-    Logger.info(' '.join(['Found', str(len(group_ids)), 'groups']))
-    # Convert to tuple of (group id, stream id)
-    indices = [(indices[i], i) for i in range(len(indices))]
-    # Sort by group id
-    indices.sort(key=lambda tup: tup[0])
-    groups = []
-    Logger.info('Extracting and grouping')
-    for group_id in group_ids:
-        group = []
-        for ind in indices:
-            if ind[0] == group_id:
-                group.append(template_list[ind[1]])
-            elif ind[0] > group_id:
-                # Because we have sorted by group id, when the index is greater
-                # than the group_id we can break the inner loop.
-                # Patch applied by CJC 05/11/2015
-                groups.append(group)
-                break
-    # Catch the final group
-    groups.append(group)
+    Logger.info('Cutting tree at distance %.3f (corr_thresh=%.3f)',
+                1 - corr_thresh, corr_thresh)
+
+    cluster_indices = fcluster(Z, t=1 - corr_thresh, criterion='distance')
+
+    # Build groups directly
+    groups_map = {}
+    for idx, label in enumerate(cluster_indices):
+        groups_map.setdefault(label, []).append(template_list[idx])
+
+    # Sort groups by size descending (optional—remove if not desired)
+    groups = [groups_map[k] for k in sorted(groups_map.keys())]
+
+    Logger.info('Found %d groups', len(groups))
     return groups
-
 
 def group_delays(stream_list):
     """
